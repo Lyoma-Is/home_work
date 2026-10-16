@@ -7,9 +7,21 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#F7F6EE">
 <title>Тетрадь заданий</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="preconnect" href="https://www.gstatic.com" crossorigin>
+<link rel="preconnect" href="https://tetrad-zadaniy-default-rtdb.firebaseio.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=PT+Sans:wght@400;700&family=PT+Mono&family=Marck+Script&display=swap" media="print" onload="this.media='all'">
+<noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=PT+Sans:wght@400;700&family=PT+Mono&family=Marck+Script&display=swap"></noscript>
+<script>
+// Для учителя заранее скачиваем Auth SDK (ученику он не нужен)
+if(!/^#student=/.test(location.hash)){
+  var _l=document.createElement('link'); _l.rel='preload'; _l.as='script';
+  _l.href='https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js';
+  document.head.appendChild(_l);
+}
+</script>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=PT+Sans:wght@400;700&family=PT+Mono&family=Marck+Script&display=swap');
-
 html{ -webkit-text-size-adjust:100%; }
 body{ margin:0; padding:0; background:#F7F6EE; }
 #app, #app *{ box-sizing:border-box; }
@@ -610,15 +622,11 @@ body{ margin:0; padding:0; background:#F7F6EE; }
   #app .numcircle{ width:32px; height:32px; min-width:32px; font-size:1rem; }
 }
 </style>
-<link href="https://cdn.jsdelivr.net/npm/quill@2.0.3/dist/quill.snow.css" rel="stylesheet">
 </head>
 <body>
 <div id="app"></div>
 <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-database-compat.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/quill@2.0.3/dist/quill.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.4/build/qrcode.min.js"></script>
 <script>
 (function(){
   const root = document.getElementById('app');
@@ -627,11 +635,46 @@ body{ margin:0; padding:0; background:#F7F6EE; }
   const fmtDate = ts => new Date(ts).toLocaleString('ru-RU', {day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'});
   const linkFor = id => location.origin + location.pathname + '#student=' + encodeURIComponent(id);
 
+  // ---------- ленивая загрузка тяжёлых библиотек ----------
+  const _lazy = {};
+  function loadScript(src){
+    if(_lazy[src]) return _lazy[src];
+    return _lazy[src] = new Promise((resolve, reject) => {
+      const el = document.createElement('script');
+      el.src = src; el.async = true;
+      el.onload = () => resolve();
+      el.onerror = () => { delete _lazy[src]; reject(new Error('load failed: ' + src)); };
+      document.head.appendChild(el);
+    });
+  }
+  function loadCss(href){
+    if(_lazy[href]) return _lazy[href];
+    return _lazy[href] = new Promise((resolve) => {
+      const el = document.createElement('link');
+      el.rel = 'stylesheet'; el.href = href;
+      el.onload = () => resolve();
+      el.onerror = () => { delete _lazy[href]; resolve(); };
+      document.head.appendChild(el);
+    });
+  }
+  function ensureQuill(){
+    if(typeof Quill !== 'undefined') return Promise.resolve();
+    return Promise.all([
+      loadCss('https://cdn.jsdelivr.net/npm/quill@2.0.3/dist/quill.snow.css'),
+      loadScript('https://cdn.jsdelivr.net/npm/quill@2.0.3/dist/quill.js')
+    ]).catch(e => console.error(e));
+  }
+  function ensureQr(){
+    if(typeof QRCode !== 'undefined') return Promise.resolve();
+    return loadScript('https://cdn.jsdelivr.net/npm/qrcode@1.5.4/build/qrcode.min.js').catch(e => console.error(e));
+  }
+
   /** Рисует QR-код ссылки в контейнер. Возвращает dataURL картинки или null. */
   async function renderQrCode(container, url, size){
     size = size || 200;
     if(!container) return null;
     container.innerHTML = '';
+    await ensureQr();
     if(typeof QRCode === 'undefined'){
       // fallback: внешний API
       const img = document.createElement('img');
@@ -775,11 +818,21 @@ body{ margin:0; padding:0; background:#F7F6EE; }
     if(typeof firebase !== 'undefined'){
       firebase.initializeApp(firebaseConfig);
       fbDb = firebase.database();
-      fbAuth = firebase.auth();
       fbReady = true;
     }
   }catch(e){
     console.error('Firebase init failed', e);
+  }
+
+  // Auth SDK нужен только учителю: подключаем по требованию
+  function ensureAuth(){
+    if(fbAuth) return Promise.resolve(fbAuth);
+    if(!fbReady) return Promise.resolve(null);
+    const ready = (typeof firebase.auth === 'function')
+      ? Promise.resolve()
+      : loadScript('https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js');
+    return ready.then(() => { fbAuth = firebase.auth(); return fbAuth; })
+                .catch(e => { console.error('Auth load failed', e); return null; });
   }
 
   function fbSafeKey(key){
@@ -848,9 +901,10 @@ body{ margin:0; padding:0; background:#F7F6EE; }
   async function sList(prefix, shared){
     if(shared && fbReady){
       try{
-        const snap = await fbDb.ref('kv').once('value');
-        const val = snap.val() || {};
         const p = fbSafeKey(prefix);
+        // запрос только по диапазону ключей, а не всей ветки kv
+        const snap = await fbDb.ref('kv').orderByKey().startAt(p).endAt(p + '\uf8ff').once('value');
+        const val = snap.val() || {};
         return Object.keys(val).filter(k => k.startsWith(p) || k.startsWith(prefix));
       }catch(e){
         console.error('fb list', e);
@@ -868,6 +922,23 @@ body{ margin:0; padding:0; background:#F7F6EE; }
       }
     }catch(e){}
     return keys;
+  }
+
+  // значения по диапазону ключей одним запросом: { ключ: значение }
+  async function sGetRange(prefix, shared){
+    const out = {};
+    if(shared && fbReady){
+      try{
+        const p = fbSafeKey(prefix);
+        const snap = await fbDb.ref('kv').orderByKey().startAt(p).endAt(p + '\uf8ff').once('value');
+        const val = snap.val() || {};
+        Object.keys(val).forEach(k => { if(k.startsWith(p) || k.startsWith(prefix)) out[k] = val[k]; });
+      }catch(e){ console.error('fb range', e); }
+      return out;
+    }
+    const keys = await sList(prefix, shared);
+    await Promise.all(keys.map(async k => { out[k] = await sGet(k, shared); }));
+    return out;
   }
 
   if(!fbReady){
@@ -1074,7 +1145,7 @@ body{ margin:0; padding:0; background:#F7F6EE; }
       <div class="studentbox fade-in">
         <h2>Вход администратора</h2>
         <label class="field">
-          <input type="email" id="adminEmail" placeholder="teacher@example.com" autocomplete="username">
+          <input type="email" id="adminEmail" placeholder="Логин" autocomplete="username">
         </label>
         <label class="field">
           <div class="pass-wrap">
@@ -1141,7 +1212,8 @@ body{ margin:0; padding:0; background:#F7F6EE; }
     emailInput.focus();
   }
 
-  function requireAdmin(thenFn){
+  async function requireAdmin(thenFn){
+    await ensureAuth();
     if(!fbAuth){
       // Firebase не загрузился — показываем форму (она сама напишет ошибку)
       return renderAdminLogin(thenFn);
@@ -1200,6 +1272,7 @@ body{ margin:0; padding:0; background:#F7F6EE; }
       route();
     };
 
+    ensureQuill(); // фоновая подгрузка редактора
     await migrateLocalMySets();
 
     const ids = await getMySetIds();
@@ -1315,12 +1388,14 @@ body{ margin:0; padding:0; background:#F7F6EE; }
   // ================= EDITOR =================
   async function renderEditor(setId){
     root.innerHTML = `<div>Загрузка…</div>`;
+    const quillReady = ensureQuill();
     let meta = null, assignments = [];
     if(setId){
       meta = await loadSetMeta(setId);
       if(!meta){ root.innerHTML = `<div class="empty">Набор не найден.</div>`; return; }
       assignments = await loadAllAssignments(meta);
     }
+    await quillReady;
     const draft = {
       id: setId || genId(),
       subject: meta ? meta.subject : '',
@@ -2428,7 +2503,7 @@ body{ margin:0; padding:0; background:#F7F6EE; }
         return `
         <div class="card ${i%2 ? 'tilt-b':'tilt-a'}" data-aid="${esc(a.id)}">
           <div class="assign-head"><div class="numcircle">${i+1}</div><div class="grow"></div></div>
-          ${renderAssignmentBody(a) || `<div class="content-text"><em>${esc(setTitle)}</em></div>`}
+          ${renderAssignmentBody(a) || ''}
           ${getFiles(a).map(f => isSafeDataUrl(f.dataUrl)
             ? `<a class="filechip" href="${esc(f.dataUrl)}" download="${esc(f.name)}" rel="noopener noreferrer">📎 Скачать: ${esc(f.name)}</a>`
             : `<span class="filechip">📎 ${esc(f.name)}</span>`).join('')}
@@ -2529,12 +2604,13 @@ body{ margin:0; padding:0; background:#F7F6EE; }
   // ================= RESPONSES VIEW =================
   async function renderResponses(setId){
     root.innerHTML = `<div>Загрузка…</div>`;
+    const respPromise = sGetRange('response:'+setId+':', true);
     const meta = await loadSetMeta(setId);
     if(!meta){ root.innerHTML = `<div class="empty">Набор не найден.</div>`; return; }
     const assignments = await loadAllAssignments(meta);
-    const keys = await sList('response:'+setId+':', true);
-    const responses = (await Promise.all(keys.map(async k => {
-      const v = await sGet(k, true);
+    const respEntries = await respPromise;
+    const responses = (await Promise.all(Object.keys(respEntries).map(async k => {
+      const v = respEntries[k];
       if(!v) return null;
       try{
         const obj = safeParseJson(v, null);
